@@ -1,0 +1,367 @@
+import os 
+
+import subprocess 
+
+import sys 
+
+import rclpy 
+
+from rclpy.node import Node 
+
+import cv2 
+
+import time 
+
+from adafruit_pca9685 import PCA9685 
+
+import board 
+
+import busio 
+
+from pyzbar.pyzbar import decode 
+
+import RPi.GPIO as GPIO 
+
+  
+
+def setup_environment(): 
+
+    # Activate the virtual environment 
+
+    venv_path = "/home/rebecca/opencv_env/bin/activate" 
+
+    if os.environ.get('VIRTUAL_ENV') != venv_path: 
+
+        print(f"Activating virtual environment: {venv_path}") 
+
+        activate_command = f"source {venv_path}" 
+
+        subprocess.run(activate_command, shell=True, executable="/bin/bash") 
+
+  
+
+    # Adjust I2C permissions 
+
+    try: 
+
+        print("Adjusting I2C permissions...") 
+
+        subprocess.run(["sudo", "chown", ":i2c", "/dev/i2c-1"], check=True) 
+
+        subprocess.run(["sudo", "chmod", "g+rw", "/dev/i2c-1"], check=True) 
+
+        print("I2C permissions adjusted successfully.") 
+
+    except subprocess.CalledProcessError as e: 
+
+        print(f"Error adjusting I2C permissions: {e}") 
+
+  
+
+    # Adjust GPIO permissions 
+
+    try: 
+
+        print("Adjusting GPIO permissions...") 
+
+        subprocess.run(["sudo", "chown", "root:gpio", "/dev/gpiomem"], check=True) 
+
+        subprocess.run(["sudo", "chmod", "g+rw", "/dev/gpiomem"], check=True) 
+
+        print("GPIO permissions adjusted successfully.") 
+
+    except subprocess.CalledProcessError as e: 
+
+        print(f"Error adjusting GPIO permissions: {e}") 
+
+  
+
+# Call the setup function before the main script logic 
+
+setup_environment() 
+
+ 
+
+class QRCodeScanner(Node): 
+
+    def __init__(self): 
+
+        super().__init__('qr_code_scanner') 
+
+  
+
+        # Initialize I2C and PCA9685 
+
+        i2c = busio.I2C(board.SCL, board.SDA) 
+
+        self.pca = PCA9685(i2c) 
+
+        self.pca.frequency = 50  # Frequency for servo control 
+
+  
+
+        # Define channels for tilt and swivel servos 
+
+        self.tilt_channel = 0 
+
+        self.swivel_channel = 1 
+
+  
+
+        # Define tilt and swivel servo angle ranges 
+
+        self.tilt_min = 0 
+
+        self.tilt_max = 72 
+
+        self.swivel_min = 0 
+
+        self.swivel_max = 90 
+
+  
+
+        # Initialize servo angles 
+
+        self.tilt_angle = self.tilt_min 
+
+        self.swivel_angle = self.swivel_min 
+
+  
+
+        # Set initial servo positions 
+
+        self.set_servo_angle(self.tilt_channel, self.tilt_angle, self.tilt_min, self.tilt_max) 
+
+        self.set_servo_angle(self.swivel_channel, self.swivel_angle, self.swivel_min, self.swivel_max) 
+
+  
+
+        # Initialize camera 
+
+        self.cap = cv2.VideoCapture(0) 
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640) 
+
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480) 
+
+  
+
+        if not self.cap.isOpened(): 
+
+            self.get_logger().error("Unable to open camera") 
+
+        else: 
+
+            self.get_logger().info("Camera opened successfully") 
+
+  
+
+        # Initialize buzzer 
+
+        self.buzzer_pin = 18  # GPIO pin connected to the buzzer 
+
+        GPIO.setmode(GPIO.BCM)  # Use Broadcom GPIO numbering 
+
+        GPIO.setup(self.buzzer_pin, GPIO.OUT)  # Set buzzer pin as output 
+
+        GPIO.output(self.buzzer_pin, GPIO.LOW)  # Ensure buzzer is off initially 
+
+  
+
+        # Define GPIO pins for communication 
+
+        self.input_signal_pin = 23  # Signal from Arduino to start camera cycle 
+
+        self.output_signal_pin = 24  # Signal to Arduino when no QR code is detected 
+
+        self.touchscreen_pin = 25  # Signal to touchscreen Arduino 
+
+        GPIO.setup(self.input_signal_pin, GPIO.IN)  # Input from main Arduino 
+
+        GPIO.setup(self.output_signal_pin, GPIO.OUT)  # Output to main Arduino 
+
+        GPIO.setup(self.touchscreen_pin, GPIO.OUT)  # Output to touchscreen Arduino 
+
+  
+
+        # Placeholder for input command (e.g., "Patient 1") 
+
+        self.target_command = "Patient 1" 
+
+  
+
+    def set_servo_angle(self, channel, angle, min_angle, max_angle): 
+
+        angle = max(min_angle, min(max_angle, angle)) 
+
+        pulse_min = 0x1000  # Minimum pulse width 
+
+        pulse_max = 0x3000  # Maximum pulse width 
+
+        pulse = int((angle / 180.0) * (pulse_max - pulse_min) + pulse_min) 
+
+        self.pca.channels[channel].duty_cycle = pulse 
+
+        self.get_logger().info(f"Set servo on channel {channel} to angle {angle} degrees") 
+
+  
+
+    def activate_buzzer(self): 
+
+        GPIO.output(self.buzzer_pin, GPIO.HIGH) 
+
+        self.get_logger().info("Buzzer activated (success)") 
+
+        time.sleep(0.5) 
+
+        GPIO.output(self.buzzer_pin, GPIO.LOW) 
+
+        self.get_logger().info("Buzzer deactivated") 
+
+  
+
+    def send_signal_to_arduino(self): 
+
+        self.get_logger().info("Sending signal to Arduino to continue moving") 
+
+        GPIO.output(self.output_signal_pin, GPIO.HIGH) 
+
+        time.sleep(0.1)  # Simulate a brief signal 
+
+        GPIO.output(self.output_signal_pin, GPIO.LOW) 
+
+  
+
+    def send_to_touchscreen(self, qr_value, is_success): 
+
+        if is_success: 
+
+            self.get_logger().info(f"Sending success signal with QR code '{qr_value}' to touchscreen Arduino") 
+
+        else: 
+
+            self.get_logger().info("Sending failure signal to touchscreen Arduino") 
+
+        GPIO.output(self.touchscreen_pin, GPIO.HIGH if is_success else GPIO.LOW) 
+
+        time.sleep(0.1)  # Brief signal duration 
+
+        GPIO.output(self.touchscreen_pin, GPIO.LOW) 
+
+  
+
+    def perform_camera_cycle(self): 
+
+        for tilt in range(self.tilt_min, self.tilt_max + 1, 5): 
+
+            self.set_servo_angle(self.tilt_channel, tilt, self.tilt_min, self.tilt_max) 
+
+            for swivel in range(self.swivel_min, self.swivel_max + 1, 10): 
+
+                self.set_servo_angle(self.swivel_channel, swivel, self.swivel_min, self.swivel_max) 
+
+                ret, frame = self.cap.read() 
+
+                if not ret: 
+
+                    self.get_logger().error("Failed to grab frame from camera") 
+
+                    continue 
+
+  
+
+                decoded_objects = decode(frame) 
+
+                if decoded_objects: 
+
+                    for obj in decoded_objects: 
+
+                        decoded_text = obj.data.decode('utf-8') 
+
+                        self.get_logger().info(f"QR Code detected: {decoded_text}") 
+
+                        if decoded_text == self.target_command: 
+
+                            self.activate_buzzer() 
+
+                            self.send_to_touchscreen(decoded_text, is_success=True) 
+
+                            return True  # Correct QR code detected 
+
+                        else: 
+
+                            self.get_logger().info("Incorrect QR Code detected, sending failure signal...") 
+
+                            self.send_to_touchscreen(decoded_text, is_success=False) 
+
+                            return False 
+
+  
+
+        self.get_logger().info("No QR Code detected after completing the cycle") 
+
+        return False  # No QR code detected 
+
+  
+
+    def scan_qr_code(self): 
+
+        while True: 
+
+            if GPIO.input(self.input_signal_pin) == GPIO.HIGH: 
+
+                self.get_logger().info("Signal received from Arduino to start camera cycle") 
+
+                qr_found = self.perform_camera_cycle() 
+
+  
+
+                if not qr_found: 
+
+                    self.send_signal_to_arduino() 
+
+  
+
+    def cleanup(self): 
+
+        self.cap.release() 
+
+        self.pca.deinit() 
+
+        GPIO.cleanup() 
+
+        cv2.destroyAllWindows() 
+
+  
+
+def main(args=None): 
+
+    rclpy.init(args=args) 
+
+    node = QRCodeScanner() 
+
+  
+
+    try: 
+
+        node.scan_qr_code() 
+
+    except KeyboardInterrupt: 
+
+        node.get_logger().info("Shutting down QR code scanner...") 
+
+    finally: 
+
+        node.cleanup() 
+
+        if rclpy.ok(): 
+
+            rclpy.shutdown() 
+
+  
+
+if __name__ == "__main__": 
+
+    main() 
+
+ 
